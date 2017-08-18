@@ -3459,6 +3459,20 @@ void Rdb_tbl_def::set_name(const std::string &name) {
   check_if_is_mysql_system_table();
 }
 
+std::shared_ptr<Rdb_key_def> Rdb_tbl_def::get_pk() {
+  std::shared_ptr<Rdb_key_def> found_key;
+  for (uint i = 0; i < m_key_count; i++) {
+    auto k = m_key_descr_arr[i];
+    if (k->m_index_type == Rdb_key_def::INDEX_TYPE_PRIMARY ||
+        k->m_index_type == Rdb_key_def::INDEX_TYPE_HIDDEN_PRIMARY) {
+      found_key = k;
+    }
+  }
+
+  DBUG_ASSERT(found_key != nullptr);
+  return found_key;
+}
+
 /*
   Static function of type my_hash_get_key that gets invoked by
   the m_ddl_hash object of type my_core::HASH.
@@ -4080,7 +4094,7 @@ int Rdb_ddl_manager::put(Rdb_tbl_def *const tbl, const bool &lock) {
 
 void Rdb_ddl_manager::remove(Rdb_tbl_def *const tbl,
                              rocksdb::WriteBatch *const batch,
-                             const bool &lock) {
+                             const GL_INDEX_ID &gl_index_id, const bool &lock) {
   if (lock)
     mysql_rwlock_wrlock(&m_rwlock);
 
@@ -4118,12 +4132,15 @@ bool Rdb_ddl_manager::rename(const std::string &from, const std::string &to,
     return true;
   }
 
+  const GL_INDEX_ID gl_index_id = rec->get_pk()->get_gl_index_id();
+
   new_rec = new Rdb_tbl_def(to);
 
   new_rec->m_key_count = rec->m_key_count;
   new_rec->m_auto_incr_val =
       rec->m_auto_incr_val.load(std::memory_order_relaxed);
   new_rec->m_key_descr_arr = rec->m_key_descr_arr;
+
   // so that it's not free'd when deleting the old rec
   rec->m_key_descr_arr = nullptr;
 
@@ -4137,7 +4154,7 @@ bool Rdb_ddl_manager::rename(const std::string &from, const std::string &to,
 
   // Create a key to add
   if (!new_rec->put_dict(m_dict, batch, new_buf, new_pos)) {
-    remove(rec, batch, false);
+    remove(rec, batch, gl_index_id, false);
     put(new_rec, false);
     res = false; // ok
   }
@@ -4555,6 +4572,7 @@ void Rdb_dict_manager::delete_index_info(rocksdb::WriteBatch *batch,
                                          const GL_INDEX_ID &gl_index_id) const {
   delete_with_prefix(batch, Rdb_key_def::INDEX_INFO, gl_index_id);
   delete_with_prefix(batch, Rdb_key_def::INDEX_STATISTICS, gl_index_id);
+  delete_with_prefix(batch, Rdb_key_def::AUTO_INC, gl_index_id);
 }
 
 bool Rdb_dict_manager::get_index_info(
@@ -4685,6 +4703,11 @@ bool Rdb_dict_manager::get_cf_flags(const uint32_t &cf_id,
   }
 
   return found;
+}
+
+void Rdb_dict_manager::get_key_from_index_id(
+    uchar *key_buf, const GL_INDEX_ID &gl_index_id) const {
+  dump_index_id(key_buf, Rdb_key_def::AUTO_INC, gl_index_id);
 }
 
 /*

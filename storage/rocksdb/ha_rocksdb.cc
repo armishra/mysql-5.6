@@ -1712,6 +1712,10 @@ protected:
   ulonglong m_update_count = 0;
   ulonglong m_delete_count = 0;
   ulonglong m_lock_count = 0;
+  ulonglong m_merge_count = 0;
+  ulonglong m_max_merge_value = 0;
+  std::unordered_map<GL_INDEX_ID, ulonglong> m_merge_map;
+  rocksdb::ColumnFamilyHandle *m_sys_cf;
 
   bool m_is_delayed_snapshot = false;
   bool m_is_two_phase = false;
@@ -1764,6 +1768,10 @@ public:
     when using walk tx list
   */
   virtual bool is_writebatch_trx() const = 0;
+
+  virtual bool process_merge(rocksdb::ColumnFamilyHandle *cf,
+                             const GL_INDEX_ID &gl_index_id,
+                             ulonglong curr_id) = 0;
 
   static void init_mutex() {
     mysql_mutex_init(key_mutex_tx_list, &s_tx_list_mutex, MY_MUTEX_INIT_FAST);
@@ -1897,6 +1905,8 @@ public:
 
   ulonglong get_delete_count() const { return m_delete_count; }
 
+  ulonglong get_merge_count() const { return m_merge_count; }
+
   void incr_insert_count() { ++m_insert_count; }
 
   void incr_update_count() { ++m_update_count; }
@@ -1972,20 +1982,62 @@ private:
   std::vector<ha_rocksdb *> m_curr_bulk_load;
 
 public:
-  int finish_bulk_load() {
-    int rc = 0;
+ /*
+   @detail This function takes in the WriteBatch of the transaction to add
+   all the ATUO_INCREMENT Merges. It does so by iterating through an
+   std::unordered_map<GL_INDEX_ID, ulonglong> and forming the AUTO_INC key
+   and a value too call Merge on. This should only be called on the commit
+   path in either prepare() or commit(), depending on 2pc.
 
-    std::vector<ha_rocksdb *>::iterator it;
-    while ((it = m_curr_bulk_load.begin()) != m_curr_bulk_load.end()) {
-      int rc2 = (*it)->finalize_bulk_load();
-      if (rc2 != 0 && rc == 0) {
-        rc = rc2;
-      }
-    }
+   @param wb
+  */
+ rocksdb::Status merge_on_map(rocksdb::WriteBatchBase *const wb) {
+   /* iterate through the merge map merging all keys into data dictionary */
+   rocksdb::Status s;
+   for (auto &it : m_merge_map) {
+     uchar key_buf[Rdb_key_def::INDEX_NUMBER_SIZE * 3] = {0};
+     uchar value_buf[RDB_SIZEOF_AUTO_INCREMENT_VERSION +
+                     ROCKSDB_SIZEOF_AUTOINC_VALUE] = {0};
 
-    DBUG_ASSERT(m_curr_bulk_load.size() == 0);
+     /* value is constructed by storing the version and the value */
+     uchar *ptr = value_buf;
+     rdb_netbuf_store_uint16(ptr, Rdb_key_def::AUTO_INCREMENT_VERSION);
+     ptr += RDB_SIZEOF_AUTO_INCREMENT_VERSION;
+     rdb_netbuf_store_uint64(ptr, it.second);
+     ptr += ROCKSDB_SIZEOF_AUTOINC_VALUE;
 
-    return rc;
+     const rocksdb::Slice value =
+         rocksdb::Slice((char *)value_buf, ptr - value_buf);
+     std::string val = value.ToString();
+
+     /* constructs AUTO_INCREMENT key for data dictionary from gl_index_id */
+     dict_manager.get_key_from_index_id((uchar *)key_buf, it.first);
+     const rocksdb::Slice key =
+         rocksdb::Slice((char *)key_buf, sizeof(key_buf));
+     s = wb->Merge(m_sys_cf, key, val);
+
+     /* return status immediately when the first merge fails */
+     if (!s.ok()) {
+       return s;
+     }
+   }
+   return s;
+ }
+
+ int finish_bulk_load() {
+   int rc = 0;
+
+   std::vector<ha_rocksdb *>::iterator it;
+   while ((it = m_curr_bulk_load.begin()) != m_curr_bulk_load.end()) {
+     int rc2 = (*it)->finalize_bulk_load();
+     if (rc2 != 0 && rc == 0) {
+       rc = rc2;
+     }
+   }
+
+   DBUG_ASSERT(m_curr_bulk_load.size() == 0);
+
+   return rc;
   }
 
   void start_bulk_load(ha_rocksdb *const bulk_load) {
@@ -2204,6 +2256,15 @@ private:
       rdb_handle_io_error(s, RDB_IO_ERROR_TX_COMMIT);
       return false;
     }
+    auto wb = get_write_batch();
+    s = merge_on_map(wb);
+
+    if (!s.ok()) {
+      rdb_handle_io_error(s, RDB_IO_ERROR_TX_COMMIT);
+      return false;
+    }
+    // clear map storing max AUTO_INCREMENT key in map
+    m_merge_map.clear();
 
     s = m_rocksdb_tx->Prepare();
     if (!s.ok()) {
@@ -2215,8 +2276,16 @@ private:
 
   bool commit_no_binlog() override {
     bool res = false;
+    rocksdb::Status s;
+
+    s = merge_on_map(m_rocksdb_tx->GetWriteBatch()->GetWriteBatch());
+
+    if (!s.ok()) {
+      rdb_handle_io_error(s, RDB_IO_ERROR_TX_COMMIT);
+      res = true;
+    }
     release_snapshot();
-    const rocksdb::Status s = m_rocksdb_tx->Commit();
+    s = m_rocksdb_tx->Commit();
     if (!s.ok()) {
       rdb_handle_io_error(s, RDB_IO_ERROR_TX_COMMIT);
       res = true;
@@ -2230,6 +2299,7 @@ private:
     m_update_count = 0;
     m_delete_count = 0;
     m_lock_count = 0;
+    m_merge_count = 0;
     set_tx_read_only(false);
     m_rollback_only = false;
     return res;
@@ -2242,6 +2312,7 @@ public:
     m_update_count = 0;
     m_delete_count = 0;
     m_lock_count = 0;
+    m_merge_count = 0;
     m_ddl_transaction = false;
     if (m_rocksdb_tx) {
       release_snapshot();
@@ -2437,6 +2508,21 @@ public:
     }
   }
 
+  bool process_merge(rocksdb::ColumnFamilyHandle *cf,
+                     const GL_INDEX_ID &gl_index_id,
+                     ulonglong curr_id) override {
+    DBUG_ASSERT(cf->GetName() == "__system__");
+    ++m_merge_count;
+
+    m_merge_map[gl_index_id] =
+        (m_merge_map.find(gl_index_id) != m_merge_map.end())
+            ? std::max(m_merge_map[gl_index_id], curr_id)
+            : curr_id;
+
+    m_sys_cf = cf;
+    return true;
+  }
+
   explicit Rdb_transaction_impl(THD *const thd)
       : Rdb_transaction(thd), m_rocksdb_tx(nullptr) {
     // Create a notifier that can be called when a snapshot gets generated.
@@ -2480,9 +2566,17 @@ private:
 
   bool commit_no_binlog() override {
     bool res = false;
+    rocksdb::Status s;
+
+    s = merge_on_map(m_batch->GetWriteBatch());
+
+    if (!s.ok()) {
+      rdb_handle_io_error(s, RDB_IO_ERROR_TX_COMMIT);
+      res = true;
+    }
     release_snapshot();
-    const rocksdb::Status s =
-        rdb->GetBaseDB()->Write(write_opts, m_batch->GetWriteBatch());
+
+    s = rdb->GetBaseDB()->Write(write_opts, m_batch->GetWriteBatch());
     if (!s.ok()) {
       rdb_handle_io_error(s, RDB_IO_ERROR_TX_COMMIT);
       res = true;
@@ -2493,6 +2587,7 @@ private:
     m_insert_count = 0;
     m_update_count = 0;
     m_delete_count = 0;
+    m_merge_count = 0;
     set_tx_read_only(false);
     m_rollback_only = false;
     return res;
@@ -2518,6 +2613,7 @@ public:
     m_update_count = 0;
     m_delete_count = 0;
     m_lock_count = 0;
+    m_merge_count = 0;
     release_snapshot();
 
     reset();
@@ -2545,6 +2641,21 @@ public:
     // Note Put/Delete in write batch doesn't return any error code. We simply
     // return OK here.
     return rocksdb::Status::OK();
+  }
+
+  bool process_merge(rocksdb::ColumnFamilyHandle *cf,
+                     const GL_INDEX_ID &gl_index_id,
+                     ulonglong curr_id) override {
+    DBUG_ASSERT(cf->GetName() == "__system__");
+    ++m_merge_count;
+
+    m_merge_map[gl_index_id] =
+        (m_merge_map.find(gl_index_id) != m_merge_map.end())
+            ? std::max(m_merge_map[gl_index_id], curr_id)
+            : curr_id;
+
+    m_sys_cf = cf;
+    return true;
   }
 
   rocksdb::Status delete_key(rocksdb::ColumnFamilyHandle *const column_family,
@@ -4351,19 +4462,54 @@ std::vector<std::string> Rdb_open_tables_map::get_table_names(void) const {
   return names;
 }
 
+/*
+  @brief This function prepares the key from the index_id of the
+  auto_increment column in the data dictionary and calls get to find the
+  current value in the auto_increment column.
+
+  @param  tx        Transaction upon which the get is needed to be called.
+  @param  index_id  Index_id of the primary key or hidden pk used to construct
+                    key to call get from the data dictionary.
+  @param  new_val   Output parameter that gets updated to the value retrieved
+                    from the data dictionary
+
+  @ret  rocksdb::Status status of the get.
+ */
+rocksdb::Status
+ha_rocksdb::data_dictionary_autoincrement(Rdb_transaction *const tx,
+                                          const GL_INDEX_ID &gl_index_id,
+                                          longlong *new_val) const {
+  auto scf = dict_manager.get_system_cf();
+  // Construct the key of the data dictionary to get the auto_increment
+  // value
+  uchar key_buf[Rdb_key_def::INDEX_NUMBER_SIZE * 3] = {0};
+  dict_manager.get_key_from_index_id((uchar *)key_buf, gl_index_id);
+  auto k = rocksdb::Slice((char *)key_buf, sizeof(key_buf));
+  std::string val;
+  auto stat = tx->get(scf, k, &val);
+  if (stat.ok()) {
+    const uchar *const value = reinterpret_cast<const uchar *>(val.c_str());
+
+    DBUG_ASSERT(rdb_netbuf_to_uint16(value) ==
+                myrocks::Rdb_key_def::AUTO_INCREMENT_VERSION);
+    *new_val = rdb_netbuf_to_uint64(value + RDB_SIZEOF_AUTO_INCREMENT_VERSION);
+  }
+  return stat;
+}
+
 void ha_rocksdb::load_auto_incr_value() {
+  bool use_datadic = false, avoid_update = false;
+  longlong new_val = 0;
+
   const int save_active_index = active_index;
   active_index = table->s->next_number_index;
   const uint8 save_table_status = table->status;
 
-  /*
-    load_auto_incr_value() may be called by statements that
-    do not execute implicit commits (i.e. SHOW CREATE TABLE).
-    index_last() creates a snapshot. When a snapshot is created
-    here, it has to be released as well. (GitHub issue#189)
-  */
   Rdb_transaction *const tx = get_or_create_tx(table->in_use);
   const bool is_new_snapshot = !tx->has_snapshot();
+  if (is_new_snapshot) {
+    tx->acquire_snapshot(true);
+  }
 
   // Do a lookup. We only need index column, so it should be index-only.
   // (another reason to make it index-only is that table->read_set is
@@ -4371,8 +4517,36 @@ void ha_rocksdb::load_auto_incr_value() {
   const bool save_keyread_only = m_keyread_only;
   m_keyread_only = true;
 
-  if (!index_last(table->record[0]))
-    update_auto_incr_val();
+  auto found_key = m_tbl_def->get_pk();
+  auto stat =
+      data_dictionary_autoincrement(tx, found_key->get_gl_index_id(), &new_val);
+  if (stat.ok()) {
+    use_datadic = true;
+#ifndef NDEBUG
+    if (!index_last(table->record[0])) {
+      my_bitmap_map *const old_map =
+          dbug_tmp_use_all_columns(table, table->read_set);
+      longlong mem_val =
+          (table->key_info[table->s->next_number_index].key_part[0].field)
+              ->val_int();
+      DBUG_ASSERT(new_val >= mem_val);
+      dbug_tmp_restore_column_map(table->read_set, old_map);
+    }
+#endif
+  }
+
+  // call index_last only if you will not be using the data dictionary
+  // auto_increment persistent store
+  if (!use_datadic) {
+    if (index_last(table->record[0])) {
+      avoid_update = true;
+    }
+  }
+
+  // if index_last failed, then avoid calling update
+  if (!avoid_update) {
+    update_auto_incr_val(use_datadic, new_val);
+  }
 
   m_keyread_only = save_keyread_only;
   if (is_new_snapshot) {
@@ -4390,26 +4564,26 @@ void ha_rocksdb::load_auto_incr_value() {
   release_scan_iterator();
 }
 
-/* Get PK value from table->record[0]. */
-/*
-  TODO(alexyang): No existing support for auto_increment on non-pk columns, see
-  end of ha_rocksdb::create. Also see opened issue here:
-  https://github.com/facebook/mysql-5.6/issues/153
-*/
-void ha_rocksdb::update_auto_incr_val() {
+void ha_rocksdb::update_auto_incr_val(bool use_datadic, longlong target_value) {
   Field *field;
   longlong new_val;
   field = table->key_info[table->s->next_number_index].key_part[0].field;
+  if (use_datadic) {
+    new_val = target_value;
+  } else {
+    my_bitmap_map *const old_map =
+        dbug_tmp_use_all_columns(table, table->read_set);
+    new_val = field->val_int();
+    dbug_tmp_restore_column_map(table->read_set, old_map);
 
-  my_bitmap_map *const old_map =
-      dbug_tmp_use_all_columns(table, table->read_set);
-  new_val = field->val_int();
-  // don't increment if we would wrap around
+    // Merge the current in memory value into the auto_increment bookkeeping
+    // in the data dictionary
+    merge_auto_increment(new_val);
+  }
+
   if (new_val != std::numeric_limits<longlong>::max()) {
     new_val++;
   }
-
-  dbug_tmp_restore_column_map(table->read_set, old_map);
 
   longlong auto_incr_val = m_tbl_def->m_auto_incr_val;
   while (auto_incr_val < new_val &&
@@ -6478,20 +6652,6 @@ int ha_rocksdb::create(const char *const name, TABLE *const table_arg,
   if (create_info->auto_increment_value)
     m_tbl_def->m_auto_incr_val = create_info->auto_increment_value;
 
-  /*
-    We only support auto_increment at start of the PRIMARY KEY.
-  */
-  // Field *field;
-  // if ((field= table_arg->next_number_field))
-  /* TODO mdcallag: disable this for now to let UNIQUE indexes kind of work
-  if ((field= table_arg->found_next_number_field))
-  {
-    int pk= table_arg->s->primary_key;
-    Field *pk_field= table_arg->key_info[pk].key_part[0].field;
-    if (field->field_index !=  pk_field->field_index)
-      DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
-  }
-  */
   DBUG_RETURN(HA_EXIT_SUCCESS);
 
 error:
@@ -8126,6 +8286,14 @@ int ha_rocksdb::write_row(uchar *const buf) {
   DBUG_RETURN(rv);
 }
 
+bool ha_rocksdb::merge_auto_increment(int curr_id) {
+  Rdb_transaction *const tx = get_or_create_tx(table->in_use);
+
+  auto scf = dict_manager.get_system_cf();
+  return tx->process_merge(scf, m_tbl_def->get_pk()->get_gl_index_id(),
+                           curr_id);
+}
+
 /**
   Constructing m_last_rowkey (MyRocks key expression) from
   before_update|delete image (MySQL row expression).
@@ -8576,7 +8744,7 @@ int ha_rocksdb::update_pk(const Rdb_key_def &kd,
   }
 
   if (table->next_number_field) {
-    update_auto_incr_val();
+    update_auto_incr_val(false);
   }
 
   int rc = HA_EXIT_SUCCESS;
@@ -9906,7 +10074,9 @@ int ha_rocksdb::delete_table(const char *const tablename) {
     Remove the table entry in data dictionary (this will also remove it from
     the persistent data dictionary).
   */
-  ddl_manager.remove(tbl, batch, true);
+  const GL_INDEX_ID gl_index_id = tbl->get_pk()->get_gl_index_id();
+  ddl_manager.remove(tbl, batch, gl_index_id, true);
+
   int err = dict_manager.commit(batch);
   if (err) {
     DBUG_RETURN(err);
@@ -10019,6 +10189,7 @@ int ha_rocksdb::rename_table(const char *const from, const char *const to) {
   const std::unique_ptr<rocksdb::WriteBatch> wb = dict_manager.begin();
   rocksdb::WriteBatch *const batch = wb.get();
   dict_manager.lock();
+
   if (ddl_manager.rename(from_str, to_str, batch)) {
     rc = HA_ERR_NO_SUCH_TABLE;
   } else {

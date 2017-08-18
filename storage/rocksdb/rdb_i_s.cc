@@ -913,7 +913,8 @@ enum {
   INDEX_NUMBER,
   INDEX_TYPE,
   KV_FORMAT_VERSION,
-  CF
+  CF,
+  AUTO_INCREMENT
 };
 } // namespace RDB_DDL_FIELD
 
@@ -929,6 +930,8 @@ static ST_FIELD_INFO rdb_i_s_ddl_fields_info[] = {
     ROCKSDB_FIELD_INFO("KV_FORMAT_VERSION", sizeof(uint16_t), MYSQL_TYPE_SHORT,
                        0),
     ROCKSDB_FIELD_INFO("CF", NAME_LEN + 1, MYSQL_TYPE_STRING, 0),
+    ROCKSDB_FIELD_INFO("AUTO_INCREMENT", sizeof(uint64_t), MYSQL_TYPE_LONGLONG,
+                       0),
     ROCKSDB_FIELD_INFO_END};
 
 int Rdb_ddl_scanner::add_table(Rdb_tbl_def *tdef) {
@@ -973,6 +976,7 @@ int Rdb_ddl_scanner::add_table(Rdb_tbl_def *tdef) {
     std::string cf_name = kd.get_cf()->GetName();
     field[RDB_DDL_FIELD::CF]->store(cf_name.c_str(), cf_name.size(),
                                     system_charset_info);
+    field[RDB_DDL_FIELD::AUTO_INCREMENT]->store(tdef->m_auto_incr_val, true);
 
     ret = my_core::schema_table_store_record(m_thd, m_table);
     if (ret)

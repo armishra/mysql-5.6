@@ -1,0 +1,111 @@
+--source include/have_rocksdb.inc
+--source include/have_binlog_format_row.inc
+--source include/count_sessions.inc
+--source include/have_debug.inc
+
+CREATE TABLE t (i INT PRIMARY KEY AUTO_INCREMENT, b INT) ENGINE=rocksdb;
+CREATE TABLE t1 (a INT PRIMARY KEY, b INT AUTO_INCREMENT, c INT, KEY(b,c)) ENGINE=rocksdb;
+
+INSERT INTO t VALUES (NULL,1), (NULL,2), (NULL,3);
+INSERT INTO t VALUES (NULL,4), (NULL,5), (NULL,6);
+
+SELECT * FROM t;
+DELETE FROM t WHERE i>3;
+SELECT * FROM t;
+
+--echo # crash_during_online_index_creation
+FLUSH LOGS;
+--exec echo "restart" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SET SESSION debug="+d,crash_during_online_index_creation";
+--error 2013
+ALTER TABLE t ADD INDEX kb(b), ALGORITHM=INPLACE;
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+INSERT INTO t VALUES (NULL,7), (NULL,8), (NULL,9);
+SELECT * FROM t;
+
+connect (con1,localhost,root,,);
+connect (con2,localhost,root,,);
+connect (con3,localhost,root,,);
+
+connection con1;
+BEGIN;
+INSERT INTO t VALUES(NULL, 10);
+INSERT INTO t VALUES(NULL, 11);
+
+connection con2;
+BEGIN;
+INSERT INTO t VALUES(NULL, 12);
+INSERT INTO t VALUES(NULL, 13);
+
+connection con3;
+INSERT INTO t VALUES(NULL, 14);
+INSERT INTO t VALUES(NULL, 15);
+
+connection con1;
+INSERT INTO t VALUES(NULL, 16);
+SELECT * FROM t;
+
+connection con2;
+INSERT INTO t VALUES(NULL, 17);
+
+connection con1;
+COMMIT;
+connection con2;
+ROLLBACK;
+connection con3;
+COMMIT;
+
+connection default;
+SELECT * FROM t;
+
+disconnect con1;
+disconnect con2;
+disconnect con3;
+
+
+INSERT INTO t1 VALUES (1,NULL,1);
+ALTER TABLE t1 DROP PRIMARY KEY;
+
+INSERT INTO t1 VALUES (2,NULL,2);
+--echo # crash_during_online_index_creation
+FLUSH LOGS;
+--exec echo "restart" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SET SESSION debug="+d,crash_during_online_index_creation";
+--error 2013
+ALTER TABLE t ADD INDEX kb(b), ALGORITHM=INPLACE;
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+INSERT INTO t1 VALUES (3,NULL,3);
+
+ALTER TABLE t1 ADD PRIMARY KEY(a);
+INSERT INTO t1 VALUES (4,NULL,4);
+
+SELECT * FROM t1;
+RENAME TABLE t1 TO x1;
+RENAME TABLE x1 TO t1;
+
+ALTER TABLE t1 MODIFY b INT;
+echo # Insert untracked record
+INSERT INTO t1 VALUES (1000,5,1000);
+DELETE FROM t1 WHERE a > 3;
+ALTER TABLE t1 MODIFY b INT AUTO_INCREMENT;
+BEGIN;
+INSERT INTO t1 VALUES (5,NULL,5);
+INSERT INTO t1 VALUES (6,NULL,6);
+COMMIT;
+SELECT * FROM t1;
+
+SET GLOBAL ROCKSDB_ENABLE_2PC = ON;
+BEGIN;
+INSERT INTO t1 VALUES (7,NULL,7);
+--exec echo "restart" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SET SESSION debug="d,crash_commit_after_prepare";
+--error 0,2013
+COMMIT;
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+SELECT * FROM t1;
+
+DROP TABLE t,t1;
+--source include/wait_until_count_sessions.inc
